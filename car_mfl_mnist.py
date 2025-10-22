@@ -231,13 +231,44 @@ class MNISTMultimodalModel(nn.Module):
 # 3. CROSS-MODAL RETRIEVAL (CORE OF CAR-MFL)
 # ============================================================================
 
-def retrieve_missing_modality(query_data, query_label, public_data, model, modality_type, top_k=5):
+def jaccard_similarity(feat1, feat2, threshold=0.5):
     """
-    Retrieve the complementary modality from public data.
+    Compute Jaccard similarity between two feature vectors.
+    Treats features as sets by thresholding.
+
+    Args:
+        feat1: First feature vector (tensor)
+        feat2: Second feature vector (tensor)
+        threshold: Threshold for binarization
+
+    Returns:
+        Jaccard similarity score (float)
+    """
+    # Binarize features (treat as sets)
+    binary1 = (feat1 > threshold).float()
+    binary2 = (feat2 > threshold).float()
+
+    # Compute intersection and union
+    intersection = (binary1 * binary2).sum().item()
+    union = ((binary1 + binary2) > 0).float().sum().item()
+
+    if union == 0:
+        return 0.0
+
+    return intersection / union
+
+
+def retrieve_missing_modality(query_data, public_data, model, modality_type, top_k=5):
+    """
+    Retrieve the complementary modality from public data using proper CAR-MFL approach.
+
+    This is the REAL CAR-MFL implementation:
+    1. Find top-k nearest neighbors based on embedding similarity (NO label)
+    2. Use Jaccard similarity to select best match from top-k
+    3. Return complementary modality
 
     Args:
         query_data: Single image or text tensor
-        query_label: Label (0-9)
         public_data: List of (image, text, label) tuples
         model: Current model for encoding
         modality_type: 'image' or 'text' (what we HAVE)
@@ -254,7 +285,7 @@ def retrieve_missing_modality(query_data, query_label, public_data, model, modal
         else:  # text
             query_feat = model.encode_text(query_data.unsqueeze(0)).squeeze(0)
 
-        # Encode all public samples and compute distances
+        # Encode all public samples and compute L2 distances
         distances = []
         for pub_img, pub_text, pub_label in public_data:
             if modality_type == 'image':
@@ -264,26 +295,32 @@ def retrieve_missing_modality(query_data, query_label, public_data, model, modal
 
             # L2 distance
             dist = torch.norm(query_feat - pub_feat).item()
-            distances.append((dist, pub_img, pub_text, pub_label))
+            distances.append((dist, pub_feat, pub_img, pub_text))
 
-        # Sort by distance (closest first)
+        # Sort by distance (closest first) and get top-k
         distances.sort(key=lambda x: x[0])
+        top_k_candidates = distances[:top_k]
 
-        # Among top-k, prefer same label
-        for _, pub_img, pub_text, pub_label in distances[:top_k]:
-            if pub_label == query_label:
-                # Return the complementary modality
-                if modality_type == 'image':
-                    return pub_text
-                else:
-                    return pub_img
+        # Among top-k, use Jaccard similarity to find best match
+        best_jaccard = -1
+        best_item = None
 
-        # If no same-label found, use closest
-        _, pub_img, pub_text, _ = distances[0]
+        for _, pub_feat, pub_img, pub_text in top_k_candidates:
+            jaccard_sim = jaccard_similarity(query_feat, pub_feat)
+            if jaccard_sim > best_jaccard:
+                best_jaccard = jaccard_sim
+                best_item = (pub_img, pub_text)
+
+        # Return the complementary modality
+        if best_item is None:
+            # Fallback to closest if Jaccard fails
+            _, _, pub_img, pub_text = top_k_candidates[0]
+            best_item = (pub_img, pub_text)
+
         if modality_type == 'image':
-            return pub_text
+            return best_item[1]  # Return text
         else:
-            return pub_img
+            return best_item[0]  # Return image
 
 
 # ============================================================================
@@ -324,11 +361,11 @@ class Client:
             total = 0
 
             for image, text, label in self.data:
-                # Augment if unimodal
+                # Augment if unimodal (NO LABEL USED IN RETRIEVAL)
                 if self.modality_type == 'image' and use_retrieval:
-                    text = retrieve_missing_modality(image, label, public_data, local_model, 'image')
+                    text = retrieve_missing_modality(image, public_data, local_model, 'image')
                 elif self.modality_type == 'text' and use_retrieval:
-                    image = retrieve_missing_modality(text, label, public_data, local_model, 'text')
+                    image = retrieve_missing_modality(text, public_data, local_model, 'text')
 
                 # Prepare batch
                 if image is not None:
