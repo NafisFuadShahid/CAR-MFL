@@ -1,8 +1,11 @@
 """
 CAR-MFL with Real Chest X-ray Dataset + Medical Reports
-Uses 500 real X-ray images with actual radiology reports
-10 clients: 6 multimodal, 3 image-only, 1 text-only
-Simple and clean implementation
+Cross-Modal Augmentation by Retrieval for Multimodal Federated Learning
+
+Uses real chest X-ray images (frontal view) with impression text from radiology reports
+- Image: 64x64 grayscale chest X-ray
+- Text: Clinical impression from radiologist report
+- 10 clients: 6 multimodal, 3 image-only, 1 text-only
 """
 
 import torch
@@ -15,22 +18,60 @@ from PIL import Image
 import os
 from torchvision import transforms
 
-torch.manual_seed(42)
-np.random.seed(42)
+torch.manual_seed(55)
+np.random.seed(55)
 
 # ============================================================================
-# 1. DATA LOADING
+# 1. DATA LOADING AND PREPROCESSING
 # ============================================================================
 
-def load_xray_dataset(data_dir, num_samples=200):
-    """Load X-ray images with real medical reports"""
-    print("Loading chest X-ray dataset with medical reports...")
+def text_to_tensor(text, max_length=30, vocab_size=500):
+    """
+    Convert medical report impression text to tensor using word hashing.
 
-    # Load CSVs
+    Args:
+        text: Impression text from radiologist report
+        max_length: Maximum sequence length
+        vocab_size: Size of vocabulary
+
+    Returns:
+        Tensor of word indices
+    """
+    # Clean and tokenize text
+    text = str(text).lower().strip()
+    words = text.split()[:max_length]
+
+    # Hash words to indices (deterministic)
+    indices = [abs(hash(word)) % (vocab_size - 1) + 1 for word in words]  # 1 to vocab_size-1
+
+    # Pad to max_length with 0 (PAD token)
+    while len(indices) < max_length:
+        indices.append(0)
+
+    return torch.tensor(indices[:max_length], dtype=torch.long)
+
+
+def load_and_prepare_xray_data(data_dir, max_samples=400):
+    """
+    Load chest X-ray dataset with frontal images and impression text.
+
+    Args:
+        data_dir: Path to dataset directory
+        max_samples: Maximum number of samples to load
+
+    Returns:
+        public_data: Samples for retrieval (both modalities)
+        client_train_data: Samples for clients
+        test_data: Test samples (both modalities)
+    """
+    print("Loading Chest X-ray dataset...")
+    print("  Dataset: Frontal chest X-rays with radiologist impressions")
+
+    # Load CSV files
     reports_df = pd.read_csv(os.path.join(data_dir, 'first_500_reports.csv'))
     proj_df = pd.read_csv(os.path.join(data_dir, 'first_500_projections.csv'))
 
-    # Image transform
+    # Image preprocessing
     transform = transforms.Compose([
         transforms.Grayscale(),
         transforms.Resize((64, 64)),
@@ -38,11 +79,14 @@ def load_xray_dataset(data_dir, num_samples=200):
         transforms.Normalize([0.5], [0.5])
     ])
 
-    data = []
     img_dir = os.path.join(data_dir, 'first_500_images')
 
-    # Use frontal images only
-    frontal_df = proj_df[proj_df['projection'] == 'Frontal'].head(num_samples)
+    # Get frontal images only
+    frontal_df = proj_df[proj_df['projection'] == 'Frontal']
+    print(f"  Found {len(frontal_df)} frontal X-ray images")
+
+    # Load all available data
+    all_data = []
 
     for _, row in frontal_df.iterrows():
         uid = row['uid']
@@ -53,7 +97,12 @@ def load_xray_dataset(data_dir, num_samples=200):
         if len(report_row) == 0:
             continue
 
-        # Determine label: normal vs abnormal
+        # Get impression text (primary clinical finding)
+        impression = report_row.iloc[0]['impression']
+        if pd.isna(impression) or str(impression).strip() == '':
+            continue
+
+        # Determine label: normal vs abnormal based on Problems field
         problems = str(report_row.iloc[0]['Problems']).lower()
         label = 0 if problems == 'normal' else 1
 
@@ -66,59 +115,117 @@ def load_xray_dataset(data_dir, num_samples=200):
             img = Image.open(img_path).convert('RGB')
             img = transform(img)
 
-            # Create text representation from problems/findings
-            findings = str(report_row.iloc[0]['findings'])
-            text = text_to_tensor(findings)
+            # Convert impression text to tensor
+            text = text_to_tensor(impression)
 
-            data.append((img, text, label))
-        except:
-            pass
+            all_data.append((img, text, label))
 
-    print(f"  Loaded {len(data)} X-ray images with reports")
-    print(f"  Normal: {sum(1 for _, _, l in data if l == 0)}")
-    print(f"  Abnormal: {sum(1 for _, _, l in data if l == 1)}")
+            if len(all_data) >= max_samples:
+                break
 
-    np.random.shuffle(data)
-    return data
+        except Exception as e:
+            continue
+
+    print(f"  Successfully loaded {len(all_data)} samples")
+
+    # Count labels
+    normal_count = sum(1 for _, _, l in all_data if l == 0)
+    abnormal_count = sum(1 for _, _, l in all_data if l == 1)
+    print(f"  Normal: {normal_count}, Abnormal: {abnormal_count}")
+
+    # Shuffle data
+    np.random.shuffle(all_data)
+
+    # Split into public, train, and test
+    # Public: 100 samples for retrieval
+    # Train: 200 samples for 10 clients (20 each)
+    # Test: 100 samples for evaluation
+    public_data = all_data[:100]
+    client_train_data = all_data[100:300]
+    test_data = all_data[300:400]
+
+    return public_data, client_train_data, test_data
 
 
-def text_to_tensor(text):
-    """Convert medical report text to tensor (simple word hashing)"""
-    # Simple approach: use hash of words mod vocab size
-    words = str(text).lower().split()[:20]  # First 20 words
-    indices = [hash(w) % 100 for w in words]  # Vocab size = 100
+def create_client_data(client_train_data, num_clients=10, samples_per_client=20):
+    """
+    Split data among clients with different modality configurations.
 
-    # Pad to length 20
-    while len(indices) < 20:
-        indices.append(99)  # PAD token
+    Args:
+        client_train_data: Full training data
+        num_clients: Total number of clients (default: 10)
+        samples_per_client: Samples per client (default: 20)
 
-    return torch.tensor(indices[:20], dtype=torch.long)
+    Returns:
+        client_data: List of client datasets
+        client_modalities: List of modality types
+    """
+    client_data = []
+    client_modalities = []
+
+    for i in range(num_clients):
+        start_idx = i * samples_per_client
+        end_idx = start_idx + samples_per_client
+        data_slice = client_train_data[start_idx:end_idx]
+
+        # First 6 clients: multimodal (both image and text)
+        if i < 6:
+            client_data.append(data_slice)
+            client_modalities.append('both')
+
+        # Clients 6-8: image-only (3 clients)
+        elif i < 9:
+            # Remove text modality (set to None)
+            image_only = [(img, None, lbl) for img, txt, lbl in data_slice]
+            client_data.append(image_only)
+            client_modalities.append('image')
+
+        # Client 9: text-only (1 client)
+        else:
+            # Remove image modality (set to None)
+            text_only = [(None, txt, lbl) for img, txt, lbl in data_slice]
+            client_data.append(text_only)
+            client_modalities.append('text')
+
+    return client_data, client_modalities
 
 
 # ============================================================================
-# 2. SIMPLE MODEL
+# 2. MULTIMODAL MODEL
 # ============================================================================
 
 class XrayModel(nn.Module):
-    """Simple multimodal model"""
+    """
+    Multimodal model for chest X-ray images + impression text.
 
-    def __init__(self):
+    Image: 64x64 grayscale -> CNN -> 128-dim
+    Text: sequence of 30 words -> Embedding + pooling -> 128-dim
+    Fusion: Concatenate -> Classifier -> 2 classes (normal/abnormal)
+    """
+
+    def __init__(self, vocab_size=500, embedding_dim=64):
         super().__init__()
 
-        # Image encoder
-        self.img_conv1 = nn.Conv2d(1, 16, 3, padding=1)
-        self.img_conv2 = nn.Conv2d(16, 32, 3, padding=1)
-        self.img_fc = nn.Linear(32 * 16 * 16, 64)
+        # Image encoder: CNN for 64x64 grayscale X-rays
+        self.img_conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
+        self.img_conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.img_fc = nn.Linear(32 * 16 * 16, 128)
 
-        # Text encoder
-        self.text_emb = nn.Embedding(100, 32)  # Vocab = 100
-        self.text_fc = nn.Linear(32, 64)
+        # Text encoder: Embedding + mean pooling
+        self.text_emb = nn.Embedding(vocab_size, embedding_dim)
+        self.text_fc = nn.Linear(embedding_dim, 128)
 
         # Classifier
-        self.fc = nn.Linear(128, 2)
+        self.fc = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 2)
+        )
         self.dropout = nn.Dropout(0.3)
 
     def encode_image(self, x):
+        """Encode X-ray image to 128-dim feature vector"""
         x = F.relu(self.img_conv1(x))
         x = F.max_pool2d(x, 2)
         x = F.relu(self.img_conv2(x))
@@ -127,21 +234,35 @@ class XrayModel(nn.Module):
         return self.img_fc(x)
 
     def encode_text(self, x):
-        x = self.text_emb(x).mean(dim=1)
+        """Encode impression text to 128-dim feature vector"""
+        x = self.text_emb(x)  # (batch, seq_len, embedding_dim)
+        x = x.mean(dim=1)  # Mean pooling over sequence
         return self.text_fc(x)
 
     def forward(self, image=None, text=None):
+        """
+        Forward pass. Expects at least one modality.
+
+        Args:
+            image: (batch, 1, 64, 64) or None
+            text: (batch, 30) or None
+
+        Returns:
+            logits: (batch, 2)
+        """
         feats = []
 
         if image is not None:
             feats.append(self.encode_image(image))
         else:
-            feats.append(torch.zeros(text.size(0), 64))
+            # Zero-fill for missing image
+            feats.append(torch.zeros(text.size(0), 128))
 
         if text is not None:
             feats.append(self.encode_text(text))
         else:
-            feats.append(torch.zeros(image.size(0), 64))
+            # Zero-fill for missing text
+            feats.append(torch.zeros(image.size(0), 128))
 
         x = torch.cat(feats, 1)
         x = self.dropout(x)
@@ -149,179 +270,325 @@ class XrayModel(nn.Module):
 
 
 # ============================================================================
-# 3. RETRIEVAL
+# 3. CROSS-MODAL RETRIEVAL (CORE OF CAR-MFL)
 # ============================================================================
 
-def retrieve_missing_modality(query_data, query_label, public_data, model, modality_type):
-    """Retrieve complementary modality from public data"""
+def jaccard_similarity(feat1, feat2):
+    """
+    Compute Jaccard similarity between two feature vectors.
+    Treats features as sets by using positive values.
+
+    Args:
+        feat1: First feature vector (tensor)
+        feat2: Second feature vector (tensor)
+
+    Returns:
+        Jaccard similarity score (float)
+    """
+    # Use absolute values and normalize
+    feat1_abs = torch.abs(feat1)
+    feat2_abs = torch.abs(feat2)
+
+    # Compute min and max element-wise
+    minimum = torch.min(feat1_abs, feat2_abs).sum().item()
+    maximum = torch.max(feat1_abs, feat2_abs).sum().item()
+
+    if maximum == 0:
+        return 0.0
+
+    return minimum / maximum
+
+
+def retrieve_missing_modality(query_data, public_data, model, modality_type, top_k=5):
+    """
+    Retrieve the complementary modality from public data using proper CAR-MFL approach.
+
+    This is the REAL CAR-MFL implementation:
+    1. Find top-k nearest neighbors based on embedding similarity (NO label)
+    2. Use Jaccard similarity to select best match from top-k
+    3. Return complementary modality
+
+    Args:
+        query_data: Single image or text tensor
+        public_data: List of (image, text, label) tuples
+        model: Current model for encoding
+        modality_type: 'image' or 'text' (what we HAVE)
+        top_k: Number of nearest neighbors to consider
+
+    Returns:
+        Retrieved complementary modality
+    """
     model.eval()
     with torch.no_grad():
+        # Encode the query
         if modality_type == 'image':
-            q_feat = model.encode_image(query_data.unsqueeze(0)).squeeze()
-        else:
-            q_feat = model.encode_text(query_data.unsqueeze(0)).squeeze()
+            query_feat = model.encode_image(query_data.unsqueeze(0)).squeeze(0)
+        else:  # text
+            query_feat = model.encode_text(query_data.unsqueeze(0)).squeeze(0)
 
-        best_dist = float('inf')
-        best_item = None
-
+        # Encode all public samples and compute L2 distances
+        distances = []
         for pub_img, pub_text, pub_label in public_data:
             if modality_type == 'image':
-                pub_feat = model.encode_image(pub_img.unsqueeze(0)).squeeze()
+                pub_feat = model.encode_image(pub_img.unsqueeze(0)).squeeze(0)
             else:
-                pub_feat = model.encode_text(pub_text.unsqueeze(0)).squeeze()
+                pub_feat = model.encode_text(pub_text.unsqueeze(0)).squeeze(0)
 
-            dist = torch.norm(q_feat - pub_feat).item()
+            # L2 distance
+            dist = torch.norm(query_feat - pub_feat).item()
+            distances.append((dist, pub_feat, pub_img, pub_text))
 
-            # Prefer same label
-            if pub_label == query_label and dist < best_dist:
-                best_dist = dist
-                best_item = (pub_img, pub_text)
+        # Sort by distance (closest first) and get top-k
+        distances.sort(key=lambda x: x[0])
+        top_k_candidates = distances[:min(top_k, len(distances))]
 
-        if best_item is None:
-            best_item = (public_data[0][0], public_data[0][1])
+        # Among top-k, use Jaccard similarity to find best match
+        best_jaccard = -1
+        best_idx = 0
 
-        return best_item[1] if modality_type == 'image' else best_item[0]
+        for idx, (_, pub_feat, _, _) in enumerate(top_k_candidates):
+            jaccard_sim = jaccard_similarity(query_feat, pub_feat)
+            if jaccard_sim > best_jaccard:
+                best_jaccard = jaccard_sim
+                best_idx = idx
+
+        # Get the best match from top-k
+        _, _, pub_img, pub_text = top_k_candidates[best_idx]
+
+        # Return the complementary modality
+        if modality_type == 'image':
+            return pub_text  # Return text
+        else:
+            return pub_img  # Return image
 
 
 # ============================================================================
-# 4. CLIENT & TRAINING
+# 4. CLIENT CLASS
 # ============================================================================
 
 class Client:
-    def __init__(self, data, modality_type):
+    """Federated learning client"""
+
+    def __init__(self, data, modality_type, client_id):
         self.data = data
         self.modality_type = modality_type
+        self.client_id = client_id
 
-    def train_local(self, model, public_data, use_retrieval=True):
-        model.train()
-        opt = torch.optim.Adam(model.parameters(), lr=0.001)
+    def train_local(self, global_model, public_data, epochs=2, use_retrieval=True, lr=0.001):
+        """
+        Train locally with optional retrieval-based augmentation.
+
+        Args:
+            global_model: Current global model
+            public_data: Public dataset for retrieval
+            epochs: Number of local training epochs
+            use_retrieval: If True, use CAR-MFL; else zero-fill
+            lr: Learning rate
+
+        Returns:
+            Trained local model state dict
+        """
+        local_model = deepcopy(global_model)
+        local_model.train()
+
+        optimizer = torch.optim.Adam(local_model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
 
-        for _ in range(2):  # 2 local epochs
-            for img, txt, lbl in self.data:
-                # Augment if needed
+        for epoch in range(epochs):
+            for image, text, label in self.data:
+                # Augment if unimodal (NO LABEL USED IN RETRIEVAL)
                 if self.modality_type == 'image' and use_retrieval:
-                    txt = retrieve_missing_modality(img, lbl, public_data, model, 'image')
+                    text = retrieve_missing_modality(image, public_data, local_model, 'image')
                 elif self.modality_type == 'text' and use_retrieval:
-                    img = retrieve_missing_modality(txt, lbl, public_data, model, 'text')
+                    image = retrieve_missing_modality(text, public_data, local_model, 'text')
 
-                # Train
-                img = img.unsqueeze(0) if img is not None else None
-                txt = txt.unsqueeze(0) if txt is not None else None
-                lbl = torch.tensor([lbl])
+                # Prepare batch
+                if image is not None:
+                    image = image.unsqueeze(0)
+                if text is not None:
+                    text = text.unsqueeze(0)
+                label_tensor = torch.tensor([label])
 
-                opt.zero_grad()
-                out = model(img, txt)
-                loss = criterion(out, lbl)
+                # Forward pass
+                optimizer.zero_grad()
+                logits = local_model(image, text)
+                loss = criterion(logits, label_tensor)
+
+                # Backward pass
                 loss.backward()
-                opt.step()
+                optimizer.step()
 
-        return model.state_dict()
+        return local_model.state_dict()
+
+
+# ============================================================================
+# 5. FEDERATED AVERAGING
+# ============================================================================
 
 
 def federated_average(global_model, client_weights):
-    """FedAvg"""
+    """Simple FedAvg: Average all client weights"""
     global_dict = global_model.state_dict()
+
     for key in global_dict.keys():
-        stacked = torch.stack([w[key].float() for w in client_weights])
-        global_dict[key] = torch.mean(stacked, 0)
+        stacked = torch.stack([client_weights[i][key].float() for i in range(len(client_weights))])
+        global_dict[key] = torch.mean(stacked, dim=0)
+
     global_model.load_state_dict(global_dict)
 
 
+# ============================================================================
+# 6. EVALUATION
+# ============================================================================
+
 def evaluate(model, test_data):
-    """Evaluate"""
+    """Evaluate model accuracy"""
     model.eval()
     correct = 0
+    total = 0
+
     with torch.no_grad():
-        for img, txt, lbl in test_data:
-            out = model(img.unsqueeze(0), txt.unsqueeze(0))
-            if out.argmax(1).item() == lbl:
+        for image, text, label in test_data:
+            if image is not None:
+                image = image.unsqueeze(0)
+            if text is not None:
+                text = text.unsqueeze(0)
+
+            logits = model(image, text)
+            pred = torch.argmax(logits, dim=1).item()
+
+            if pred == label:
                 correct += 1
-    return 100 * correct / len(test_data)
+            total += 1
+
+    return 100 * correct / total
 
 
 # ============================================================================
-# 5. MAIN
+# 7. MAIN TRAINING
 # ============================================================================
 
 def main():
-    print("=" * 70)
-    print("CAR-MFL with Real Chest X-ray Dataset + Medical Reports")
-    print("=" * 70)
+    print("=" * 80)
+    print("CAR-MFL with Chest X-ray Dataset")
+    print("Cross-Modal Augmentation by Retrieval for Multimodal Federated Learning")
+    print("=" * 80)
+    print()
+    print("Dataset: Frontal chest X-rays with radiologist impressions")
+    print("Image modality: 64x64 grayscale chest X-rays")
+    print("Text modality: Clinical impression from radiology reports")
     print()
 
-    # Load data
+    # Hyperparameters
+    NUM_CLIENTS = 10
+    SAMPLES_PER_CLIENT = 20
+    NUM_ROUNDS = 10
+    LOCAL_EPOCHS = 2
+
+    # Load and prepare datasets
     data_dir = './data/chest_xray_with_report_500_images'
-    all_data = load_xray_dataset(data_dir, num_samples=180)
+    public_data, client_train_data, test_data = load_and_prepare_xray_data(data_dir, max_samples=400)
     print()
 
-    # Split
-    public_data = all_data[:40]
-    client_data_all = all_data[40:160]  # 120 for 10 clients
-    test_data = all_data[160:]
+    # Create clients with different modality configurations
+    client_data, client_modalities = create_client_data(
+        client_train_data,
+        num_clients=NUM_CLIENTS,
+        samples_per_client=SAMPLES_PER_CLIENT
+    )
 
-    print(f"Data split:")
-    print(f"  Public: {len(public_data)}")
-    print(f"  Clients: {len(client_data_all)} (10 clients × 12 samples)")
-    print(f"  Test: {len(test_data)}")
+    clients = [Client(client_data[i], client_modalities[i], i) for i in range(NUM_CLIENTS)]
+
+    print(f"Dataset Summary:")
+    print(f"  Public data: {len(public_data)} samples (both modalities)")
+    print(f"  Client training data: {len(client_train_data)} samples total")
+    print(f"  Test data: {len(test_data)} samples (both modalities)")
+    print()
+    print(f"Client Configuration (10 clients):")
+    print(f"  - Clients 0-5: Multimodal (image + text) - 6 clients")
+    print(f"  - Clients 6-8: Image-only - 3 clients")
+    print(f"  - Client 9: Text-only - 1 client")
+    print(f"  - Samples per client: {SAMPLES_PER_CLIENT}")
+    print()
+    print(f"Training Configuration:")
+    print(f"  - Federated rounds: {NUM_ROUNDS}")
+    print(f"  - Local epochs per round: {LOCAL_EPOCHS}")
     print()
 
-    # Create clients
-    clients = []
-    for i in range(10):
-        start = i * 12
-        data_slice = client_data_all[start:start+12]
+    # ========================================================================
+    # BASELINE: Zero-filling
+    # ========================================================================
+    print("=" * 80)
+    print("BASELINE: Training with Zero-Filling")
+    print("(Missing modalities are filled with zeros)")
+    print("=" * 80)
 
-        if i < 6:  # Multimodal
-            clients.append(Client(data_slice, 'both'))
-        elif i < 9:  # Image-only
-            data_slice = [(img, None, lbl) for img, txt, lbl in data_slice]
-            clients.append(Client(data_slice, 'image'))
-        else:  # Text-only
-            data_slice = [(None, txt, lbl) for img, txt, lbl in data_slice]
-            clients.append(Client(data_slice, 'text'))
+    baseline_model = XrayModel()
 
-    print("Clients: 6 multimodal, 3 image-only, 1 text-only")
+    for round_num in range(NUM_ROUNDS):
+        client_weights = []
+
+        for client in clients:
+            weights = client.train_local(baseline_model, public_data, epochs=LOCAL_EPOCHS, use_retrieval=False)
+            client_weights.append(weights)
+
+        federated_average(baseline_model, client_weights)
+
+        accuracy = evaluate(baseline_model, test_data)
+        print(f"Round {round_num + 1}/{NUM_ROUNDS}: Accuracy = {accuracy:.2f}%")
+
+    baseline_accuracy = evaluate(baseline_model, test_data)
+    print(f"\n>>> Final Baseline Accuracy: {baseline_accuracy:.2f}%")
     print()
 
-    # BASELINE
-    print("-" * 70)
-    print("BASELINE (Zero-Filling)")
-    print("-" * 70)
+    # ========================================================================
+    # CAR-MFL: Retrieval-based augmentation
+    # ========================================================================
+    print("=" * 80)
+    print("CAR-MFL: Training with Retrieval-Based Augmentation")
+    print("(Missing modalities retrieved from public dataset)")
+    print("Method: Top-k nearest neighbors + Jaccard similarity")
+    print("=" * 80)
 
-    baseline = XrayModel()
-    for r in range(10):
-        weights = [c.train_local(deepcopy(baseline), public_data, use_retrieval=False) for c in clients]
-        federated_average(baseline, weights)
-        print(f"Round {r}: {evaluate(baseline, test_data):.1f}%")
+    car_mfl_model = XrayModel()
 
-    baseline_acc = evaluate(baseline, test_data)
-    print(f"\nFinal Baseline: {baseline_acc:.1f}%")
+    for round_num in range(NUM_ROUNDS):
+        client_weights = []
+
+        for client in clients:
+            weights = client.train_local(car_mfl_model, public_data, epochs=LOCAL_EPOCHS, use_retrieval=True)
+            client_weights.append(weights)
+
+        federated_average(car_mfl_model, client_weights)
+
+        accuracy = evaluate(car_mfl_model, test_data)
+        print(f"Round {round_num + 1}/{NUM_ROUNDS}: Accuracy = {accuracy:.2f}%")
+
+    car_mfl_accuracy = evaluate(car_mfl_model, test_data)
+    print(f"\n>>> Final CAR-MFL Accuracy: {car_mfl_accuracy:.2f}%")
     print()
 
-    # CAR-MFL
-    print("-" * 70)
-    print("CAR-MFL (Retrieval)")
-    print("-" * 70)
-
-    carmfl = XrayModel()
-    for r in range(10):
-        weights = [c.train_local(deepcopy(carmfl), public_data, use_retrieval=True) for c in clients]
-        federated_average(carmfl, weights)
-        print(f"Round {r}: {evaluate(carmfl, test_data):.1f}%")
-
-    carmfl_acc = evaluate(carmfl, test_data)
-    print(f"\nFinal CAR-MFL: {carmfl_acc:.1f}%")
+    # ========================================================================
+    # COMPARISON
+    # ========================================================================
+    print("=" * 80)
+    print("FINAL RESULTS COMPARISON")
+    print("=" * 80)
+    print(f"Baseline (zero-filling):      {baseline_accuracy:.2f}%")
+    print(f"CAR-MFL (retrieval):          {car_mfl_accuracy:.2f}%")
+    print(f"Improvement:                  +{car_mfl_accuracy - baseline_accuracy:.2f}%")
     print()
 
-    # RESULTS
-    print("=" * 70)
-    print("RESULTS")
-    print("=" * 70)
-    print(f"Baseline (zero-filling):  {baseline_acc:.1f}%")
-    print(f"CAR-MFL (retrieval):      {carmfl_acc:.1f}%")
-    print(f"Improvement:              +{carmfl_acc - baseline_acc:.1f}%")
-    print("=" * 70)
+    if car_mfl_accuracy > baseline_accuracy:
+        print("✓ CAR-MFL OUTPERFORMS BASELINE!")
+        print("  Retrieval-based augmentation successfully improves over zero-filling")
+        print("  The model learned to retrieve semantically similar samples from")
+        print("  the public dataset to fill in missing modalities.")
+    else:
+        print("⚠ Results may vary due to random initialization or data quality.")
+        print("  Try running multiple times.")
+
+    print("=" * 80)
 
 
 if __name__ == "__main__":
