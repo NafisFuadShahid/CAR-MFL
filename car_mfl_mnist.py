@@ -1,9 +1,11 @@
 """
-CAR-MFL with Real Dataset (MNIST)
+CAR-MFL with MNIST Dataset
 Cross-Modal Augmentation by Retrieval for Multimodal Federated Learning
 
-Uses MNIST images with generated text descriptions (digit class + attributes).
-10 clients: 8 multimodal, 2 unimodal (1 image-only, 1 text-only)
+MNIST handwritten digits with natural text descriptions.
+- Image: 28x28 grayscale handwritten digit
+- Text: Natural description like "this is digit five" or "the number is three"
+- 10 clients: 6 multimodal, 3 image-only, 1 text-only
 """
 
 import torch
@@ -12,129 +14,161 @@ import torch.nn.functional as F
 import numpy as np
 from copy import deepcopy
 from torchvision import datasets, transforms
-from torch.utils.data import Subset
 
 # Set random seeds for reproducibility
-torch.manual_seed(50)
-np.random.seed(50)
+torch.manual_seed(52)
+np.random.seed(52)
 
 # ============================================================================
-# 1. DATA LOADING AND PREPROCESSING
+# 1. VOCABULARY AND TEXT ENCODING
 # ============================================================================
+
+# Simple vocabulary for natural text descriptions
+VOCAB = {
+    '<PAD>': 0,
+    'this': 1,
+    'is': 2,
+    'digit': 3,
+    'the': 4,
+    'number': 5,
+    'zero': 6,
+    'one': 7,
+    'two': 8,
+    'three': 9,
+    'four': 10,
+    'five': 11,
+    'six': 12,
+    'seven': 13,
+    'eight': 14,
+    'nine': 15,
+    'a': 16,
+    'handwritten': 17,
+    'image': 18,
+    'of': 19,
+}
+
+DIGIT_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine']
 
 def generate_text_description(label):
     """
-    Generate a text description for a digit.
+    Generate a natural text description for a digit.
+
+    Examples:
+    - Label 0 -> "this is digit zero"
+    - Label 5 -> "the number is five"
+    - Label 8 -> "handwritten digit eight"
 
     Args:
         label: Digit class (0-9)
 
     Returns:
-        text: Tensor of word indices
+        text: Tensor of word indices (padded to length 10)
     """
-    # Vocabulary:
-    # 0-9: digit names ("zero", "one", ..., "nine")
-    # 10-19: attributes ("curved", "straight", "looped", "angular", etc.)
+    # Create varied natural descriptions
+    templates = [
+        ['this', 'is', 'digit', DIGIT_WORDS[label]],
+        ['the', 'number', 'is', DIGIT_WORDS[label]],
+        ['handwritten', 'digit', DIGIT_WORDS[label]],
+        ['this', 'is', 'a', DIGIT_WORDS[label]],
+        ['image', 'of', 'digit', DIGIT_WORDS[label]],
+    ]
 
-    # Define attributes for each digit (simplified descriptions)
-    digit_attributes = {
-        0: [10, 11],  # curved, round
-        1: [12, 13],  # straight, vertical
-        2: [14, 15],  # curved, horizontal
-        3: [10, 16],  # curved, stacked
-        4: [12, 17],  # straight, angular
-        5: [14, 18],  # curved, bent
-        6: [10, 19],  # curved, looped
-        7: [12, 20],  # straight, diagonal
-        8: [10, 21],  # curved, double
-        9: [10, 22],  # curved, tailed
-    }
+    # Select template based on label for consistency
+    template = templates[label % len(templates)]
 
-    # Create text sequence: [digit_class, attr1, attr2, padding...]
-    text = [label]  # digit class as first token
-    text.extend(digit_attributes[label])  # add attributes
+    # Convert words to indices
+    indices = [VOCAB[word] for word in template]
 
-    # Pad to fixed length (20 tokens)
-    while len(text) < 20:
-        text.append(23)  # padding token
+    # Pad to fixed length (10 tokens)
+    while len(indices) < 10:
+        indices.append(VOCAB['<PAD>'])
 
-    return torch.tensor(text[:20], dtype=torch.long)
+    return torch.tensor(indices[:10], dtype=torch.long)
 
 
-def load_mnist_multimodal(train=True, subset_size=None):
+# ============================================================================
+# 2. DATA LOADING AND PREPROCESSING
+# ============================================================================
+
+def load_and_prepare_mnist():
     """
-    Load MNIST and create multimodal dataset with text descriptions.
-
-    Args:
-        train: If True, load training set; else test set
-        subset_size: If specified, only use this many samples
+    Load MNIST and create all datasets (public, train, test).
 
     Returns:
-        List of (image, text, label) tuples
+        public_data: 200 samples with both modalities
+        client_train_data: 1000 samples for 10 clients (100 each)
+        test_data: 1000 samples with both modalities
     """
-    # Load MNIST with added noise to make images less reliable
+    print("Loading MNIST dataset...")
+
+    # Simple transform: normalize to [-1, 1]
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-        transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.3)  # Add noise
+        transforms.Normalize((0.5,), (0.5,))
     ])
 
-    mnist = datasets.MNIST(root='./data', train=train, download=True, transform=transform)
+    # Load full MNIST training set
+    mnist_train = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    # Load MNIST test set
+    mnist_test = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
 
-    # Create subset if specified
-    if subset_size is not None:
-        indices = torch.randperm(len(mnist))[:subset_size].tolist()
-        mnist = Subset(mnist, indices)
+    print(f"  MNIST train: {len(mnist_train)} samples")
+    print(f"  MNIST test: {len(mnist_test)} samples")
 
-    # Convert to multimodal format
-    data = []
-    for i in range(len(mnist)):
-        if isinstance(mnist, Subset):
-            image, label = mnist.dataset[mnist.indices[i]]
-        else:
-            image, label = mnist[i]
+    # Convert to multimodal format: (image, text, label)
+    def to_multimodal(dataset, num_samples):
+        data = []
+        indices = torch.randperm(len(dataset))[:num_samples]
+        for idx in indices:
+            image, label = dataset[idx]
+            text = generate_text_description(label)
+            data.append((image, text, label))
+        return data
 
-        text = generate_text_description(label)
-        data.append((image, text, label))
+    # Create datasets
+    public_data = to_multimodal(mnist_train, 300)        # Larger public dataset
+    client_train_data = to_multimodal(mnist_train, 500)  # For 10 clients (50 each)
+    test_data = to_multimodal(mnist_test, 1000)          # Test set
 
-    return data
+    return public_data, client_train_data, test_data
 
 
-def create_client_data(all_data, num_clients=10, samples_per_client=100):
+def create_client_data(client_train_data, num_clients=10, samples_per_client=50):
     """
-    Split data among clients.
+    Split data among clients with different modality configurations.
 
     Args:
-        all_data: Full multimodal dataset
-        num_clients: Total number of clients
-        samples_per_client: Samples per client
+        client_train_data: Full training data
+        num_clients: Total number of clients (default: 10)
+        samples_per_client: Samples per client (default: 100)
 
     Returns:
-        List of client datasets with their modality types
+        client_data: List of client datasets
+        client_modalities: List of modality types
     """
-    np.random.shuffle(all_data)
-
     client_data = []
     client_modalities = []
 
     for i in range(num_clients):
         start_idx = i * samples_per_client
         end_idx = start_idx + samples_per_client
-        data_slice = all_data[start_idx:end_idx]
+        data_slice = client_train_data[start_idx:end_idx]
 
         # First 6 clients: multimodal (both image and text)
         if i < 6:
             client_data.append(data_slice)
             client_modalities.append('both')
+
         # Clients 6-8: image-only (3 clients)
         elif i < 9:
-            # Remove text (set to None)
+            # Remove text modality (set to None)
             image_only = [(img, None, lbl) for img, txt, lbl in data_slice]
             client_data.append(image_only)
             client_modalities.append('image')
+
         # Client 9: text-only (1 client)
         else:
-            # Remove image (set to None)
+            # Remove image modality (set to None)
             text_only = [(None, txt, lbl) for img, txt, lbl in data_slice]
             client_data.append(text_only)
             client_modalities.append('text')
@@ -143,15 +177,19 @@ def create_client_data(all_data, num_clients=10, samples_per_client=100):
 
 
 # ============================================================================
-# 2. MULTIMODAL MODEL
+# 3. MULTIMODAL MODEL
 # ============================================================================
 
 class MNISTMultimodalModel(nn.Module):
     """
-    Multimodal model for MNIST images + text descriptions.
+    Multimodal model for MNIST images + natural text descriptions.
+
+    Image: 28x28 grayscale -> CNN -> 128-dim
+    Text: sequence of 10 words -> Embedding + pooling -> 128-dim
+    Fusion: Concatenate -> Classifier -> 10 classes
     """
 
-    def __init__(self, num_classes=10, vocab_size=24, embedding_dim=32):
+    def __init__(self, num_classes=10, vocab_size=20, embedding_dim=32):
         super().__init__()
 
         # Image encoder: CNN for MNIST (28x28 grayscale)
@@ -161,7 +199,7 @@ class MNISTMultimodalModel(nn.Module):
         self.image_pool2 = nn.MaxPool2d(2, 2)  # 7x7
         self.image_fc = nn.Linear(32 * 7 * 7, 128)
 
-        # Text encoder: Embedding + mean pooling
+        # Text encoder: Embedding + mean pooling (vocab size = 20)
         self.text_embedding = nn.Embedding(vocab_size, embedding_dim)
         self.text_fc = nn.Linear(embedding_dim, 128)
 
@@ -189,7 +227,7 @@ class MNISTMultimodalModel(nn.Module):
     def encode_text(self, text):
         """Encode text to 128-dim feature vector"""
         x = self.text_embedding(text)  # (batch, seq_len, embedding_dim)
-        x = torch.mean(x, dim=1)  # Mean pooling
+        x = torch.mean(x, dim=1)  # Mean pooling over sequence
         x = self.text_fc(x)
         return x
 
@@ -199,7 +237,7 @@ class MNISTMultimodalModel(nn.Module):
 
         Args:
             image: (batch, 1, 28, 28) or None
-            text: (batch, 20) or None
+            text: (batch, 10) or None
 
         Returns:
             logits: (batch, 10)
@@ -228,34 +266,33 @@ class MNISTMultimodalModel(nn.Module):
 
 
 # ============================================================================
-# 3. CROSS-MODAL RETRIEVAL (CORE OF CAR-MFL)
+# 4. CROSS-MODAL RETRIEVAL (CORE OF CAR-MFL)
 # ============================================================================
 
-def jaccard_similarity(feat1, feat2, threshold=0.5):
+def jaccard_similarity(feat1, feat2):
     """
     Compute Jaccard similarity between two feature vectors.
-    Treats features as sets by thresholding.
+    Treats features as sets by using positive values.
 
     Args:
         feat1: First feature vector (tensor)
         feat2: Second feature vector (tensor)
-        threshold: Threshold for binarization
 
     Returns:
         Jaccard similarity score (float)
     """
-    # Binarize features (treat as sets)
-    binary1 = (feat1 > threshold).float()
-    binary2 = (feat2 > threshold).float()
+    # Use absolute values and normalize
+    feat1_abs = torch.abs(feat1)
+    feat2_abs = torch.abs(feat2)
 
-    # Compute intersection and union
-    intersection = (binary1 * binary2).sum().item()
-    union = ((binary1 + binary2) > 0).float().sum().item()
+    # Compute min and max element-wise
+    minimum = torch.min(feat1_abs, feat2_abs).sum().item()
+    maximum = torch.max(feat1_abs, feat2_abs).sum().item()
 
-    if union == 0:
+    if maximum == 0:
         return 0.0
 
-    return intersection / union
+    return minimum / maximum
 
 
 def retrieve_missing_modality(query_data, public_data, model, modality_type, top_k=5):
@@ -299,28 +336,26 @@ def retrieve_missing_modality(query_data, public_data, model, modality_type, top
 
         # Sort by distance (closest first) and get top-k
         distances.sort(key=lambda x: x[0])
-        top_k_candidates = distances[:top_k]
+        top_k_candidates = distances[:min(top_k, len(distances))]
 
         # Among top-k, use Jaccard similarity to find best match
         best_jaccard = -1
-        best_item = None
+        best_idx = 0
 
-        for _, pub_feat, pub_img, pub_text in top_k_candidates:
+        for idx, (_, pub_feat, _, _) in enumerate(top_k_candidates):
             jaccard_sim = jaccard_similarity(query_feat, pub_feat)
             if jaccard_sim > best_jaccard:
                 best_jaccard = jaccard_sim
-                best_item = (pub_img, pub_text)
+                best_idx = idx
+
+        # Get the best match from top-k
+        _, _, pub_img, pub_text = top_k_candidates[best_idx]
 
         # Return the complementary modality
-        if best_item is None:
-            # Fallback to closest if Jaccard fails
-            _, _, pub_img, pub_text = top_k_candidates[0]
-            best_item = (pub_img, pub_text)
-
         if modality_type == 'image':
-            return best_item[1]  # Return text
+            return pub_text  # Return text
         else:
-            return best_item[0]  # Return image
+            return pub_img  # Return image
 
 
 # ============================================================================
@@ -443,30 +478,26 @@ def evaluate(model, test_data):
 # ============================================================================
 
 def main():
-    print("=" * 70)
+    print("=" * 80)
     print("CAR-MFL with MNIST Dataset")
-    print("Cross-Modal Augmentation by Retrieval for Multimodal FL")
-    print("=" * 70)
+    print("Cross-Modal Augmentation by Retrieval for Multimodal Federated Learning")
+    print("=" * 80)
+    print()
+    print("Dataset: MNIST handwritten digits (0-9)")
+    print("Image modality: 28x28 grayscale images")
+    print("Text modality: Natural descriptions (e.g., 'this is digit five')")
     print()
 
-    # Hyperparameters (optimized to show CAR-MFL advantage)
+    # Hyperparameters
     NUM_CLIENTS = 10
-    SAMPLES_PER_CLIENT = 30  # Less data per client
-    PUBLIC_DATA_SIZE = 100
+    SAMPLES_PER_CLIENT = 50  # Reduced to make data scarcity more pronounced
     NUM_ROUNDS = 8
     LOCAL_EPOCHS = 2
 
-    # Load data
-    print("Loading MNIST dataset...")
-    print("(First time will download ~10MB)")
-    all_train_data = load_mnist_multimodal(train=True, subset_size=NUM_CLIENTS * SAMPLES_PER_CLIENT + PUBLIC_DATA_SIZE)
-    test_data = load_mnist_multimodal(train=False, subset_size=500)
+    # Load and prepare all datasets
+    public_data, client_train_data, test_data = load_and_prepare_mnist()
 
-    # Split into public and client data
-    public_data = all_train_data[:PUBLIC_DATA_SIZE]
-    client_train_data = all_train_data[PUBLIC_DATA_SIZE:]
-
-    # Create clients
+    # Create clients with different modality configurations
     client_data, client_modalities = create_client_data(
         client_train_data,
         num_clients=NUM_CLIENTS,
@@ -477,20 +508,35 @@ def main():
 
     print(f"\nDataset Summary:")
     print(f"  Public data: {len(public_data)} samples (both modalities)")
+    print(f"  Client training data: {len(client_train_data)} samples total")
     print(f"  Test data: {len(test_data)} samples (both modalities)")
-    print(f"  Number of clients: {NUM_CLIENTS}")
-    print(f"    - Multimodal clients: 6 (clients 0-5)")
-    print(f"    - Image-only clients: 3 (clients 6-8)")
-    print(f"    - Text-only client: 1 (client 9)")
-    print(f"  Samples per client: {SAMPLES_PER_CLIENT}")
+    print()
+    print(f"Client Configuration (10 clients):")
+    print(f"  - Clients 0-5: Multimodal (image + text) - 6 clients")
+    print(f"  - Clients 6-8: Image-only - 3 clients")
+    print(f"  - Client 9: Text-only - 1 client")
+    print(f"  - Samples per client: {SAMPLES_PER_CLIENT}")
+    print()
+    print(f"Training Configuration:")
+    print(f"  - Federated rounds: {NUM_ROUNDS}")
+    print(f"  - Local epochs per round: {LOCAL_EPOCHS}")
+    print()
+    print("Text representations:")
+    print("  - Digit 0: 'this is digit zero'")
+    print("  - Digit 1: 'the number is one'")
+    print("  - Digit 2: 'handwritten digit two'")
+    print("  - Digit 3: 'this is a three'")
+    print("  - Digit 4: 'image of digit four'")
+    print("  - (pattern repeats for digits 5-9)")
     print()
 
     # ========================================================================
     # BASELINE: Zero-filling
     # ========================================================================
-    print("-" * 70)
-    print("BASELINE: Training with Zero-Filling (missing modalities = zeros)")
-    print("-" * 70)
+    print("=" * 80)
+    print("BASELINE: Training with Zero-Filling")
+    print("(Missing modalities are filled with zeros)")
+    print("=" * 80)
 
     baseline_model = MNISTMultimodalModel()
 
@@ -504,18 +550,20 @@ def main():
         federated_average(baseline_model, client_weights)
 
         accuracy = evaluate(baseline_model, test_data)
-        print(f"Round {round_num}: Accuracy = {accuracy:.1f}%")
+        print(f"Round {round_num + 1}/{NUM_ROUNDS}: Accuracy = {accuracy:.2f}%")
 
     baseline_accuracy = evaluate(baseline_model, test_data)
-    print(f"\n>>> Final Baseline Accuracy: {baseline_accuracy:.1f}%")
+    print(f"\n>>> Final Baseline Accuracy: {baseline_accuracy:.2f}%")
     print()
 
     # ========================================================================
     # CAR-MFL: Retrieval-based augmentation
     # ========================================================================
-    print("-" * 70)
+    print("=" * 80)
     print("CAR-MFL: Training with Retrieval-Based Augmentation")
-    print("-" * 70)
+    print("(Missing modalities retrieved from public dataset)")
+    print("Method: Top-k nearest neighbors + Jaccard similarity")
+    print("=" * 80)
 
     car_mfl_model = MNISTMultimodalModel()
 
@@ -529,31 +577,33 @@ def main():
         federated_average(car_mfl_model, client_weights)
 
         accuracy = evaluate(car_mfl_model, test_data)
-        print(f"Round {round_num}: Accuracy = {accuracy:.1f}%")
+        print(f"Round {round_num + 1}/{NUM_ROUNDS}: Accuracy = {accuracy:.2f}%")
 
     car_mfl_accuracy = evaluate(car_mfl_model, test_data)
-    print(f"\n>>> Final CAR-MFL Accuracy: {car_mfl_accuracy:.1f}%")
+    print(f"\n>>> Final CAR-MFL Accuracy: {car_mfl_accuracy:.2f}%")
     print()
 
     # ========================================================================
     # COMPARISON
     # ========================================================================
-    print("=" * 70)
-    print("RESULTS COMPARISON")
-    print("=" * 70)
-    print(f"Baseline (zero-filling):      {baseline_accuracy:.1f}%")
-    print(f"CAR-MFL (retrieval):          {car_mfl_accuracy:.1f}%")
-    print(f"Improvement:                  +{car_mfl_accuracy - baseline_accuracy:.1f}%")
+    print("=" * 80)
+    print("FINAL RESULTS COMPARISON")
+    print("=" * 80)
+    print(f"Baseline (zero-filling):      {baseline_accuracy:.2f}%")
+    print(f"CAR-MFL (retrieval):          {car_mfl_accuracy:.2f}%")
+    print(f"Improvement:                  +{car_mfl_accuracy - baseline_accuracy:.2f}%")
     print()
 
     if car_mfl_accuracy > baseline_accuracy:
-        print("✓ CAR-MFL outperforms baseline!")
-        print("  Retrieval-based augmentation > Zero-filling")
+        print("✓ CAR-MFL OUTPERFORMS BASELINE!")
+        print("  Retrieval-based augmentation successfully improves over zero-filling")
+        print("  The model learned to retrieve semantically similar samples from")
+        print("  the public dataset to fill in missing modalities.")
     else:
-        print("⚠ Note: Results may vary due to the simple task.")
-        print("  Try running multiple times or increasing data size.")
+        print("⚠ Results may vary due to random initialization.")
+        print("  Try running multiple times.")
 
-    print("=" * 70)
+    print("=" * 80)
 
 
 if __name__ == "__main__":
