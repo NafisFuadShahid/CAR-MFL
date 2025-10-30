@@ -269,6 +269,113 @@ class MNISTMultimodalModel(nn.Module):
 # 4. CROSS-MODAL RETRIEVAL (CORE OF CAR-MFL)
 # ============================================================================
 
+def calculate_modality_distribution(clients):
+    """
+    Calculate the distribution of modality types across clients.
+    
+    Args:
+        clients: List of Client objects
+        
+    Returns:
+        Dictionary with counts of each modality type
+    """
+    distribution = {'both': 0, 'image': 0, 'text': 0}
+    for client in clients:
+        distribution[client.modality_type] += 1
+    return distribution
+
+def compute_feature_statistics(model, data_samples, modality='image'):
+    """
+    Compute mean and std of features for given modality.
+    
+    Args:
+        model: Neural network model
+        data_samples: List of data samples
+        modality: 'image' or 'text'
+        
+    Returns:
+        Tuple of (mean, std) of features
+    """
+    model.eval()
+    features = []
+    
+    with torch.no_grad():
+        for sample in data_samples[:min(100, len(data_samples))]:
+            if modality == 'image' and sample[0] is not None:
+                feat = model.encode_image(sample[0].unsqueeze(0)).squeeze(0)
+                features.append(feat)
+            elif modality == 'text' and sample[1] is not None:
+                feat = model.encode_text(sample[1].unsqueeze(0)).squeeze(0)
+                features.append(feat)
+    
+    if len(features) > 0:
+        features = torch.stack(features)
+        return features.mean().item(), features.std().item()
+    return 0.0, 0.0
+
+def validate_data_integrity(data):
+    """
+    Validate that data samples have correct format.
+    
+    Args:
+        data: List of (image, text, label) tuples
+        
+    Returns:
+        Boolean indicating if data is valid
+    """
+    if len(data) == 0:
+        return False
+    
+    for img, txt, lbl in data:
+        if lbl < 0 or lbl > 9:
+            return False
+        if img is not None and img.shape != torch.Size([1, 28, 28]):
+            return False
+        if txt is not None and len(txt) != 10:
+            return False
+    
+    return True
+
+
+def get_label_distribution(data):
+    """
+    Get the distribution of labels in the dataset.
+    
+    Args:
+        data: List of (image, text, label) tuples
+        
+    Returns:
+        Dictionary mapping label to count
+    """
+    label_counts = {i: 0 for i in range(10)}
+    for _, _, label in data:
+        label_counts[label] += 1
+    return label_counts
+
+def normalize_weights(weights_dict):
+    """
+    Normalize model weights for better aggregation.
+    This is an optional preprocessing step.
+    
+    Args:
+        weights_dict: Model state dictionary
+        
+    Returns:
+        Normalized weights dictionary
+    """
+    normalized = {}
+    for key, tensor in weights_dict.items():
+        if 'weight' in key and len(tensor.shape) > 1:
+            # Apply L2 normalization to weight matrices
+            norm = torch.norm(tensor, p=2)
+            if norm > 0:
+                normalized[key] = tensor / (norm + 1e-8)
+            else:
+                normalized[key] = tensor
+        else:
+            normalized[key] = tensor
+    return normalized
+
 def label_to_set(label):
     """
     Convert a digit label (0-9) to a set representation for Jaccard similarity.
@@ -301,7 +408,6 @@ def label_to_set(label):
         properties.add('high')
 
     return properties
-
 
 def jaccard_similarity_labels(label1, label2):
     """
